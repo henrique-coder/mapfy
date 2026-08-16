@@ -1,8 +1,6 @@
 name: Publish release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
@@ -10,47 +8,141 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  publish:
+  validate:
+    name: Validate release version
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Validate project version
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/prod" ]; then
+            echo "::error::Releases can only be published from the prod branch."
+            exit 1
+          fi
+
+          mapfile -t METADATA < <(python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as file:
+              project = tomllib.load(file)
+          with open("uv.lock", "rb") as file:
+              lock = tomllib.load(file)
+
+          package_name = project["project"]["name"]
+          project_version = project["project"]["version"]
+          lock_version = next(
+              package["version"]
+              for package in lock["package"]
+              if package["name"] == package_name
+          )
+          print(package_name)
+          print(project_version)
+          print(lock_version)
+          PY
+          )
+
+          PACKAGE_NAME=${METADATA[0]}
+          VERSION=${METADATA[1]}
+          LOCK_VERSION=${METADATA[2]}
+
+          if [ "$VERSION" != "$LOCK_VERSION" ]; then
+            echo "::error::pyproject.toml ($VERSION) and uv.lock ($LOCK_VERSION) must match."
+            exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::The release version must use MAJOR.MINOR.PATCH format."
+            exit 1
+          fi
+          if ! grep -Fq "## [$VERSION] - " CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated section for [$VERSION]."
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          PUBLISH=true
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            PUBLISH=false
+            echo "$TAG is already published."
+          elif git show-ref --tags --verify --quiet "refs/tags/$TAG"; then
+            if [ "$(git rev-list -n 1 "$TAG")" != "$GITHUB_SHA" ]; then
+              echo "::error::$TAG exists and points to another commit."
+              exit 1
+            fi
+          fi
+
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify release candidate
+    needs: validate
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
         with:
           enable-cache: true
           python-version: "3.11"
-      - name: Validate version
-        run: |
-          python - <<'PY'
-          import re
-          import tomllib
-
-          with open("pyproject.toml", "rb") as file:
-              version = tomllib.load(file)["project"]["version"]
-          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
-              raise SystemExit("project.version must use MAJOR.MINOR.PATCH")
-          if f"## [{version}] - " not in open("CHANGELOG.md", encoding="utf-8").read():
-              raise SystemExit(f"CHANGELOG.md has no dated section for {version}")
-          PY
-          test "${GITHUB_REF_NAME}" = "v$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
       - name: Install dependencies
         run: uv sync --frozen --all-groups
-      - name: Verify source
+      - name: Check source
         run: just check
+
+  publish:
+    name: Publish package
+    needs:
+      - validate
+      - verify
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          enable-cache: true
+          python-version: "3.11"
       - name: Build distributions
         run: uv build
+      - name: Validate distributions
+        run: uvx --from twine twine check dist/*
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@ed0c53931b7bdf76dcfab693b834485b429e1fff
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --generate-notes || gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+        run: |
+          gh release create "${{ needs.validate.outputs.tag }}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --generate-notes || gh release upload "${{ needs.validate.outputs.tag }}" dist/* --clobber
