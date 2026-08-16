@@ -141,7 +141,7 @@ jobs:
       - name: Validate distributions
         run: uvx --from twine twine check dist/*
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@ed0c53931b7bdf76dcfab693b834485b429e1fff
+        run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
