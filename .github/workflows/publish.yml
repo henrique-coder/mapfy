@@ -108,8 +108,12 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: uv sync --frozen --all-groups
-      - name: Check source
-        run: just check
+      - name: Check Python
+        run: |
+          uv run ruff format --check src tests
+          uv run ruff check src tests
+          uv run ty check src
+          uv run pytest
 
   publish:
     name: Publish package
