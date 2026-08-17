@@ -1,8 +1,9 @@
 """Google Maps client."""
 
-import re
+from math import atan2, cos, degrees, radians, sin
+from re import search
 from typing import Self
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from curl_cffi import requests
 
@@ -20,10 +21,11 @@ from mapfy.parser import GoogleMapsParser
 
 STREETVIEW_SEARCH_URL = "https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch"
 STREETVIEW_BASE_URL = "https://streetviewpixels-pa.googleapis.com/v1"
+FULL_CIRCLE_DEGREES = 360.0
 
 
 class Mapfy:
-    """Query Google Maps and enrich matching locations with Street View data."""
+    """Query Google Maps and return normalized location results with images."""
 
     __slots__ = ("_parser", "_session")
 
@@ -68,36 +70,57 @@ class Mapfy:
             raise ValueError(message)
 
         results = self._search(query, near, language, country)
+
         results = results if limit is None else results[:limit]
 
-        return [self._with_cover(place) for place in results]
+        return [self._with_image(place) for place in results]
 
-    def _with_cover(self, place: PlaceResult) -> PlaceResult:
-        if place.streetview.get("panoid"):
-            return place.model_copy(update={"streetview": self._streetview_data(str(place.streetview["panoid"]))})
+    def _with_image(self, place: PlaceResult) -> PlaceResult:
+        if place.image_url:
+            image_url = self._streetview_url(source_url=place.image_url)
+
+            return place.model_copy(update={"image_url": image_url})
 
         if place.latitude is None or place.longitude is None:
             return place
 
-        panoid = self._panoid(place.latitude, place.longitude)
+        panorama = self._panorama(place.latitude, place.longitude)
 
-        if panoid is None:
+        if panorama is None:
             return place
 
-        return place.model_copy(update={"streetview": self._streetview_data(panoid)})
+        panoid, yaw = panorama
+        image_url = self._streetview_url(panoid=panoid, yaw=yaw)
+
+        return place.model_copy(update={"image_url": image_url})
 
     @staticmethod
-    def _streetview_data(panoid: str) -> dict[str, str]:
-        return {
-            "panoid": panoid,
-            "image_url": (
-                f"{STREETVIEW_BASE_URL}/thumbnail?panoid={panoid}"
-                "&cb_client=search.gws-prod.gps&w=1920&h=1080"
-                "&yaw=-10&pitch=0&thumbfov=100"
-            ),
-        }
+    def _streetview_url(
+        panoid: str | None = None,
+        source_url: str | None = None,
+        yaw: float | None = None,
+    ) -> str:
+        if source_url:
+            parsed = urlsplit(unquote(source_url))
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query["w"] = "1920"
+            query["h"] = "1080"
 
-    def _panoid(self, latitude: float, longitude: float) -> str | None:
+            return unquote(urlunsplit(parsed._replace(query=urlencode(query))))
+
+        if panoid is None or yaw is None:
+            message = "panoid and yaw are required when source_url is absent"
+            raise ValueError(message)
+
+        camera_yaw = Mapfy._number(yaw)
+
+        return (
+            f"{STREETVIEW_BASE_URL}/thumbnail?panoid={panoid}"
+            "&cb_client=search.gws-prod.gps&w=1920&h=1080"
+            f"&yaw={camera_yaw}&pitch=0&thumbfov=100"
+        )
+
+    def _panorama(self, latitude: float, longitude: float) -> tuple[str, float] | None:
         pb = (
             f"!1m5!1sapiv3!5sUS!11m2!1m1!1b0!2m4!1m2!3d{latitude}!4d{longitude}!2d50"
             "!3m10!2m2!1sen!2sUS!9m1!1e2!11m4!1m3!1e2!2b1!3e2"
@@ -108,9 +131,44 @@ class Mapfy:
             params={"pb": pb, "callback": "_xdc_._v2mub5"},
         )
         response.raise_for_status()
-        match = re.search(r'\[\d+,"([A-Za-z0-9_-]{16,64})"\]', response.text)
+        panoid = search(r'\[\d+,"([A-Za-z0-9_-]{16,64})"\]', response.text)
+        coordinates = search(
+            r"\[null,null,(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\]",
+            response.text,
+        )
 
-        return match.group(1) if match else None
+        if panoid is None or coordinates is None:
+            return None
+
+        panorama_latitude = float(coordinates.group(1))
+        panorama_longitude = float(coordinates.group(2))
+        yaw = self._bearing(
+            panorama_latitude,
+            panorama_longitude,
+            latitude,
+            longitude,
+        )
+
+        return panoid.group(1), yaw
+
+    @staticmethod
+    def _bearing(
+        origin_latitude: float,
+        origin_longitude: float,
+        target_latitude: float,
+        target_longitude: float,
+    ) -> float:
+        origin = radians(origin_latitude)
+        target = radians(target_latitude)
+        longitude_delta = radians(target_longitude - origin_longitude)
+        y = sin(longitude_delta) * cos(target)
+        x = cos(origin) * sin(target) - sin(origin) * cos(target) * cos(longitude_delta)
+
+        return (degrees(atan2(y, x)) + FULL_CIRCLE_DEGREES) % FULL_CIRCLE_DEGREES
+
+    @staticmethod
+    def _number(value: float) -> str:
+        return f"{value:.6f}".rstrip("0").rstrip(".")
 
     def _search(
         self,
