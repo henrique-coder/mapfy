@@ -2,6 +2,11 @@ name: Publish release
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Release version to publish in MAJOR.MINOR.PATCH format
+        required: true
+        type: string
 
 concurrency:
   group: release-${{ github.repository }}
@@ -16,12 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
+      previous_tag: ${{ steps.release.outputs.previous_tag }}
       publish: ${{ steps.release.outputs.publish }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
     steps:
       - name: Checkout source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -29,6 +35,7 @@ jobs:
         id: release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           if [ "$GITHUB_REF" != "refs/heads/prod" ]; then
             echo "::error::Releases can only be published from the prod branch."
@@ -36,6 +43,7 @@ jobs:
           fi
 
           mapfile -t METADATA < <(python - <<'PY'
+          import os
           import tomllib
 
           with open("pyproject.toml", "rb") as file:
@@ -51,21 +59,28 @@ jobs:
               if package["name"] == package_name
           )
           print(package_name)
+          print(os.environ["RELEASE_VERSION"])
           print(project_version)
           print(lock_version)
           PY
           )
 
           PACKAGE_NAME=${METADATA[0]}
-          VERSION=${METADATA[1]}
-          LOCK_VERSION=${METADATA[2]}
+          INPUT_VERSION=${METADATA[1]}
+          VERSION=${METADATA[2]}
+          LOCK_VERSION=${METADATA[3]}
+
+          if ! [[ "$INPUT_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::The release version must use MAJOR.MINOR.PATCH format."
+            exit 1
+          fi
+          if [ "$INPUT_VERSION" != "$VERSION" ]; then
+            echo "::error::The workflow version ($INPUT_VERSION) must match pyproject.toml ($VERSION)."
+            exit 1
+          fi
 
           if [ "$VERSION" != "$LOCK_VERSION" ]; then
             echo "::error::pyproject.toml ($VERSION) and uv.lock ($LOCK_VERSION) must match."
-            exit 1
-          fi
-          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "::error::The release version must use MAJOR.MINOR.PATCH format."
             exit 1
           fi
           if ! grep -Fq "## [$VERSION] - " CHANGELOG.md; then
@@ -74,19 +89,23 @@ jobs:
           fi
 
           TAG="v$VERSION"
-          PUBLISH=true
+          PREVIOUS_TAG=$(git tag --list 'v[0-9]*' --sort=-version:refname | grep -vxF "$TAG" | head -n 1 || true)
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            PUBLISH=false
-            echo "$TAG is already published."
-          elif git show-ref --tags --verify --quiet "refs/tags/$TAG"; then
-            if [ "$(git rev-list -n 1 "$TAG")" != "$GITHUB_SHA" ]; then
-              echo "::error::$TAG exists and points to another commit."
-              exit 1
-            fi
+            echo "::error::GitHub release $TAG already exists."
+            exit 1
+          fi
+          if git show-ref --tags --verify --quiet "refs/tags/$TAG"; then
+            echo "::error::Git tag $TAG already exists."
+            exit 1
+          fi
+          if curl --fail --silent --show-error "https://pypi.org/pypi/$PACKAGE_NAME/$VERSION/json" >/dev/null; then
+            echo "::error::PyPI already contains $PACKAGE_NAME $VERSION."
+            exit 1
           fi
 
           echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
-          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
@@ -98,16 +117,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@v9
         with:
           enable-cache: true
           python-version: "3.11"
       - name: Install dependencies
-        run: uv sync --frozen --all-groups
+        run: uv sync --frozen --no-dev --group lint --group test
       - name: Check Python
         run: |
           uv run ruff format --check src tests
@@ -128,25 +147,59 @@ jobs:
       id-token: write
     steps:
       - name: Checkout source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        uses: astral-sh/setup-uv@v9
         with:
           enable-cache: true
           python-version: "3.11"
+      - name: Install release tools
+        run: uv sync --frozen --no-dev --group release
       - name: Build distributions
         run: uv build
       - name: Validate distributions
-        run: uvx --from twine twine check dist/*
+        run: uv run --no-sync twine check dist/*
       - name: Publish to PyPI
         run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/ dist/*
+      - name: Prepare release notes
+        env:
+          PREVIOUS_TAG: ${{ needs.validate.outputs.previous_tag }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          python - "$RELEASE_VERSION" "$PREVIOUS_TAG" "$RELEASE_TAG" "$GITHUB_REPOSITORY" > release_notes.md <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version, previous_tag, release_tag, repository = sys.argv[1:]
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = rf"^## \[{re.escape(version)}\].*?\n(.*?)(?=^## |\Z)"
+          match = re.search(pattern, changelog, re.MULTILINE | re.DOTALL)
+
+          if match is None or not match.group(1).strip():
+              raise SystemExit(f"CHANGELOG.md has no usable section for {version}.")
+
+          print(match.group(1).strip())
+          print()
+          if previous_tag:
+              print(f"**Full changelog:** https://github.com/{repository}/compare/{previous_tag}...{release_tag}")
+          PY
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ needs.validate.outputs.tag }}" dist/* \
+          RELEASE_TAG="${{ needs.validate.outputs.tag }}"
+          if ! git show-ref --tags --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA"
+          fi
+          gh release create "$RELEASE_TAG" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --generate-notes || gh release upload "${{ needs.validate.outputs.tag }}" dist/* --clobber
+            --title "$RELEASE_TAG" \
+            --notes-file release_notes.md \
+            --verify-tag
