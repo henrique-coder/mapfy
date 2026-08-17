@@ -1,4 +1,4 @@
-"""Google Maps search and Street View results."""
+"""Google Maps search results, direct Maps links, and image URLs."""
 
 from mapfy.client import Mapfy
 from mapfy.models import PlaceResult
