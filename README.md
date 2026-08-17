@@ -1,12 +1,15 @@
 # Mapfy
 
 Mapfy queries public Google Maps results, normalizes each candidate as a
-`PlaceResult`, and builds ready-to-use Street View image links.
+`PlaceResult`, builds a direct Google Maps link, and returns a single Street View
+image URL when one is available.
 
 ## What it returns
 
 Each result can include `place_id`, `name`, `category`, `address`, `website`,
-`streetview`, `rating`, `reviews_count`, `latitude`, and `longitude`.
+`rating`, `reviews_count`, `latitude`, `longitude`, `maps_url`, and `image_url`.
+`maps_url` opens the location in Google Maps; `image_url` points to its Street
+View image and does not expose the panorama ID separately.
 
 Mapfy uses an internal Maps endpoint that Google does not document. Changes to
 the response format may require a parser update.
@@ -37,7 +40,7 @@ with Mapfy() as client:
     )
 
 for place in places:
-    print(place.name, place.maps_url, place.streetview)
+    print(place.name, place.maps_url, place.image_url)
 ```
 
 `near` is optional and accepts an address, a coordinate string (`"47.61,-122.33"`),
@@ -68,7 +71,7 @@ src/mapfy/
 ## Development
 
 ```bash
-uv sync --all-groups
+uv sync --no-dev --group lint --group test
 uv run ruff format
 uv run ruff check
 uv run ty check
