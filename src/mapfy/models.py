@@ -19,10 +19,7 @@ class PlaceResult(BaseModel):
     latitude: float | None = Field(default=None, description="Latitude in degrees.")
     longitude: float | None = Field(default=None, description="Longitude in degrees.")
     website: str | None = Field(default=None, description="Place website URL.")
-    streetview: dict[str, str] = Field(
-        default_factory=dict,
-        description="Stable panorama ID and a ready-to-fetch full-HD image URL.",
-    )
+    image_url: str | None = Field(default=None, description="Street View image URL.")
 
     @computed_field
     @property
