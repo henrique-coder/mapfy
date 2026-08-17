@@ -30,7 +30,7 @@ body:
     id: version
     attributes:
       label: Mapfy version
-      placeholder: "0.1.0"
+      placeholder: "Version installed in your environment"
     validations:
       required: true
   - type: input
