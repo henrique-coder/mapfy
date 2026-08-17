@@ -77,7 +77,7 @@ class GoogleMapsParser:
             latitude=cls._float(QueryBuilder.nested(coordinates, 2)),
             longitude=cls._float(QueryBuilder.nested(coordinates, 3)),
             website=cls._url(QueryBuilder.nested(website, 0)),
-            streetview=cls._streetview(info),
+            image_url=cls._streetview_url(info),
         )
 
     @classmethod
@@ -123,22 +123,18 @@ class GoogleMapsParser:
         return unquote(result) if result is not None else None
 
     @classmethod
-    def _streetview(cls, info: list[object]) -> dict[str, str]:
+    def _streetview_url(cls, info: list[object]) -> str | None:
         for value in cls._strings(info):
             if "streetviewpixels-pa.googleapis.com/v1/thumbnail" not in value:
                 continue
 
             parsed = urlsplit(unquote(value))
-            query = parse_qs(parsed.query)
-            panoid = query.get("panoid", [""])[0]
+            panoid = parse_qs(parsed.query).get("panoid", [""])[0]
 
             if panoid:
-                return {
-                    "panoid": panoid,
-                    "url": unquote(value),
-                }
+                return unquote(value)
 
-        return {}
+        return None
 
     @classmethod
     def _strings(cls, value: object) -> list[str]:
